@@ -10,15 +10,11 @@ logger = logging.getLogger(__name__)
 
 
 class ParameterValidator:
-    """Validates and maps OpenAI Chat Completions parameters to Claude Code SDK options."""
+    """Validates and maps OpenAI Chat Completions parameters to Claude Code options."""
     
-    # Supported Claude Code SDK models
+    # Stable Claude Code CLI model aliases
     SUPPORTED_MODELS = {
-        "claude-sonnet-4-20250514",
-        "claude-opus-4-20250514", 
-        "claude-3-7-sonnet-20250219",
-        "claude-3-5-sonnet-20241022",
-        "claude-3-5-haiku-20241022"
+        "opus", "sonnet", "haiku"
     }
     
     # Valid permission modes for Claude Code SDK
@@ -26,9 +22,9 @@ class ParameterValidator:
     
     @classmethod
     def validate_model(cls, model: str) -> bool:
-        """Validate that the model is supported by Claude Code SDK."""
+        """Warn when a model is not one of the advertised CLI aliases."""
         if model not in cls.SUPPORTED_MODELS:
-            logger.warning(f"Model '{model}' may not be supported by Claude Code SDK. Supported models: {cls.SUPPORTED_MODELS}")
+            logger.warning(f"Model '{model}' is not an advertised Claude Code CLI alias. Aliases: {cls.SUPPORTED_MODELS}")
             return False
         return True
     
