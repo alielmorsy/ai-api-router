@@ -29,6 +29,8 @@ from models import (
     SessionListResponse
 )
 from claude_cli import ClaudeCodeCLI
+from agy_cli import AgyCLI
+from agy_tools import TOOL_RESULT_SCHEMA, build_tool_prompt, parse_tool_result
 from message_adapter import MessageAdapter
 from auth import verify_api_key, security, validate_claude_code_auth, get_claude_code_auth_info
 from parameter_validator import ParameterValidator, CompatibilityReporter
@@ -36,6 +38,9 @@ from session_manager import session_manager
 
 # Load environment variables
 load_dotenv()
+BACKEND = os.getenv("AGENT_BACKEND", "agy").lower()
+if BACKEND not in {"claude", "agy"}:
+    raise ValueError("AGENT_BACKEND must be 'claude' or 'agy'")
 
 # Configure logging based on debug mode
 DEBUG_MODE = os.getenv('DEBUG_MODE', 'false').lower() in ('true', '1', 'yes', 'on')
@@ -104,9 +109,9 @@ def prompt_for_api_protection() -> Optional[str]:
             return None
 
 # Initialize Claude CLI
-claude_cli = ClaudeCodeCLI(
+claude_cli = (AgyCLI if BACKEND == "agy" else ClaudeCodeCLI)(
     timeout=int(os.getenv("MAX_TIMEOUT", "600000")),
-    cwd=os.getenv("CLAUDE_CWD")
+    cwd=os.getenv("AGY_CWD" if BACKEND == "agy" else "CLAUDE_CWD")
 )
 
 
@@ -116,7 +121,7 @@ async def lifespan(app: FastAPI):
     logger.info("Verifying Claude Code authentication and CLI...")
     
     # Validate authentication first
-    auth_valid, auth_info = validate_claude_code_auth()
+    auth_valid, auth_info = (True, {"method": "agy CLI"}) if BACKEND == "agy" else validate_claude_code_auth()
     
     if not auth_valid:
         logger.error("❌ Claude Code authentication failed!")
@@ -158,11 +163,25 @@ async def lifespan(app: FastAPI):
     
     # Start session cleanup task
     session_manager.start_cleanup_task()
+    async def reap_agy_workers():
+        while True:
+            await asyncio.sleep(60)
+            await claude_cli.reap_idle()
+
+    worker_reaper = asyncio.create_task(reap_agy_workers()) if BACKEND == "agy" else None
     
     yield
     
     # Cleanup on shutdown
     logger.info("Shutting down session manager...")
+    if worker_reaper:
+        worker_reaper.cancel()
+        try:
+            await worker_reaper
+        except asyncio.CancelledError:
+            pass
+    if BACKEND == "agy":
+        await claude_cli.shutdown()
     session_manager.shutdown()
 
 
@@ -305,7 +324,114 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     )
 
 
-async def generate_streaming_response(
+async def generate_agy_tool_completion(
+    request: ChatCompletionRequest, request_id: str
+) -> ChatCompletionResponse:
+    """Ask agy to choose from the caller's functions without running CLI tools."""
+    all_messages, actual_session_id = session_manager.process_messages(
+        request.messages, request.session_id
+    )
+    prior_call_names = {
+        call.get("id"): call.get("function", {}).get("name")
+        for message in all_messages
+        for call in message.tool_calls or []
+    }
+    for message in request.messages:
+        if message.role == "tool":
+            logger.info(
+                "program tool result request=%s call=%s name=%s outcome=received",
+                request_id, message.tool_call_id,
+                prior_call_names.get(message.tool_call_id),
+            )
+    conversation, system_prompt = MessageAdapter.messages_to_prompt(all_messages)
+    prompt = build_tool_prompt(conversation, system_prompt, request)
+    new_conversation, _ = MessageAdapter.messages_to_prompt(request.messages)
+    incremental_prompt = build_tool_prompt(new_conversation, system_prompt, request)
+    structured_output = None
+    async for chunk in claude_cli.run_completion(
+        prompt=prompt,
+        model=request.model,
+        effort=request.agy_effort,
+        structured_schema=TOOL_RESULT_SCHEMA,
+        external_tools=True,
+        request_id=request_id,
+        stream=False,
+        session_id=actual_session_id,
+        incremental_prompt=incremental_prompt,
+        context_key=build_tool_prompt("", system_prompt, request),
+    ):
+        if chunk.get("type") == "result":
+            structured_output = chunk.get("structured_output")
+    if structured_output is None:
+        raise HTTPException(status_code=502, detail="Antigravity returned no structured tool response")
+    try:
+        content, tool_calls = parse_tool_result(structured_output, request)
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    for call in tool_calls:
+        logger.info(
+            "program tool requested request=%s call=%s name=%s outcome=requested",
+            request_id, call["id"], call["function"]["name"],
+        )
+
+    assistant_message = Message(
+        role="assistant", content=content, tool_calls=tool_calls or None
+    )
+    if actual_session_id:
+        session_manager.add_assistant_response(actual_session_id, assistant_message)
+    completion_tokens = MessageAdapter.estimate_tokens(
+        content or json.dumps(tool_calls)
+    )
+    prompt_tokens = MessageAdapter.estimate_tokens(prompt)
+    return ChatCompletionResponse(
+        id=request_id,
+        model=request.model,
+        choices=[Choice(
+            index=0, message=assistant_message,
+            finish_reason="tool_calls" if tool_calls else "stop",
+        )],
+        usage=Usage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+        ),
+    )
+
+
+async def generate_agy_tool_stream(
+    response: ChatCompletionResponse, request_id: str
+) -> AsyncGenerator[str, None]:
+    """Emit a valid OpenAI tool-call stream after the structured agy result."""
+    choice = response.choices[0]
+    role_chunk = ChatCompletionStreamResponse(
+        id=request_id, model=response.model,
+        choices=[StreamChoice(index=0, delta={"role": "assistant"})],
+    )
+    yield f"data: {role_chunk.model_dump_json()}\n\n"
+    if choice.message.tool_calls:
+        for index, call in enumerate(choice.message.tool_calls):
+            chunk = ChatCompletionStreamResponse(
+                id=request_id, model=response.model,
+                choices=[StreamChoice(index=0, delta={
+                    "tool_calls": [{"index": index, **call}]
+                })],
+            )
+            yield f"data: {chunk.model_dump_json()}\n\n"
+    else:
+        chunk = ChatCompletionStreamResponse(
+            id=request_id, model=response.model,
+            choices=[StreamChoice(index=0, delta={"content": choice.message.content or ""})],
+        )
+        yield f"data: {chunk.model_dump_json()}\n\n"
+    final_chunk = ChatCompletionStreamResponse(
+        id=request_id, model=response.model,
+        choices=[StreamChoice(index=0, delta={}, finish_reason=choice.finish_reason)],
+    )
+    yield f"data: {final_chunk.model_dump_json()}\n\n"
+    yield "data: [DONE]\n\n"
+
+
+async def _generate_streaming_response_impl(
     request: ChatCompletionRequest,
     request_id: str,
     claude_headers: Optional[Dict[str, Any]] = None
@@ -322,6 +448,8 @@ async def generate_streaming_response(
         
         # Filter content for unsupported features
         prompt = MessageAdapter.filter_content(prompt)
+        new_prompt, _ = MessageAdapter.messages_to_prompt(request.messages)
+        new_prompt = MessageAdapter.filter_content(new_prompt)
         if system_prompt:
             system_prompt = MessageAdapter.filter_content(system_prompt)
         
@@ -333,7 +461,7 @@ async def generate_streaming_response(
             claude_options.update(claude_headers)
         
         # Validate model
-        if claude_options.get('model'):
+        if BACKEND == "claude" and claude_options.get('model'):
             ParameterValidator.validate_model(claude_options['model'])
         
         # Handle tools - disabled by default for OpenAI compatibility
@@ -344,9 +472,9 @@ async def generate_streaming_response(
                                 'NotebookEdit', 'WebFetch', 'TodoRead', 'TodoWrite', 'WebSearch']
             claude_options['disallowed_tools'] = disallowed_tools
             claude_options['max_turns'] = 1  # Single turn for Q&A
-            logger.info("Tools disabled (default behavior for OpenAI compatibility)")
+            logger.info("Antigravity plan mode selected" if BACKEND == "agy" else "Tools disabled (default behavior for OpenAI compatibility)")
         else:
-            logger.info("Tools enabled by user request")
+            logger.info("Antigravity auto mode selected" if BACKEND == "agy" else "Tools enabled by user request")
         
         # Run Claude Code
         chunks_buffer = []
@@ -360,7 +488,9 @@ async def generate_streaming_response(
             max_turns=claude_options.get('max_turns', 10),
             allowed_tools=claude_options.get('allowed_tools'),
             disallowed_tools=claude_options.get('disallowed_tools'),
-            stream=True
+            stream=True,
+            **({"effort": request.agy_effort, "request_id": request_id,
+                "session_id": actual_session_id, "incremental_prompt": new_prompt} if BACKEND == "agy" else {})
         ):
             chunks_buffer.append(chunk)
             
@@ -404,9 +534,9 @@ async def generate_streaming_response(
                             continue
                             
                         # Filter out tool usage and thinking blocks
-                        filtered_text = MessageAdapter.filter_content(raw_text)
+                        filtered_text = raw_text if BACKEND == "agy" else MessageAdapter.filter_content(raw_text)
                             
-                        if filtered_text and not filtered_text.isspace():
+                        if filtered_text and (BACKEND == "agy" or not filtered_text.isspace()):
                             # Create streaming chunk
                             stream_chunk = ChatCompletionStreamResponse(
                                 id=request_id,
@@ -423,9 +553,9 @@ async def generate_streaming_response(
                 
                 elif isinstance(content, str):
                     # Filter out tool usage and thinking blocks
-                    filtered_content = MessageAdapter.filter_content(content)
+                    filtered_content = content if BACKEND == "agy" else MessageAdapter.filter_content(content)
                     
-                    if filtered_content and not filtered_content.isspace():
+                    if filtered_content and (BACKEND == "agy" or not filtered_content.isspace()):
                         # Create streaming chunk
                         stream_chunk = ChatCompletionStreamResponse(
                             id=request_id,
@@ -499,8 +629,17 @@ async def generate_streaming_response(
         yield f"data: {json.dumps(error_chunk)}\n\n"
 
 
-@app.post("/v1/chat/completions")
-async def chat_completions(
+async def generate_streaming_response(
+    request: ChatCompletionRequest,
+    request_id: str,
+    claude_headers: Optional[Dict[str, Any]] = None,
+) -> AsyncGenerator[str, None]:
+    async with session_manager.request_lock(request.session_id):
+        async for event in _generate_streaming_response_impl(request, request_id, claude_headers):
+            yield event
+
+
+async def _chat_completions_impl(
     request_body: ChatCompletionRequest,
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
@@ -510,7 +649,7 @@ async def chat_completions(
     await verify_api_key(request, credentials)
     
     # Validate Claude Code authentication
-    auth_valid, auth_info = validate_claude_code_auth()
+    auth_valid, auth_info = (True, {"method": "agy CLI"}) if BACKEND == "agy" else validate_claude_code_auth()
     
     if not auth_valid:
         error_detail = {
@@ -534,6 +673,22 @@ async def chat_completions(
         if logger.isEnabledFor(logging.DEBUG):
             compatibility_report = CompatibilityReporter.generate_compatibility_report(request_body)
             logger.debug(f"Compatibility report: {compatibility_report}")
+
+        program_tools = (
+            request_body.tools is not None
+            or request_body.tool_choice is not None
+            or any(message.role == "tool" for message in request_body.messages)
+        )
+        if program_tools and BACKEND == "claude":
+            raise HTTPException(status_code=400, detail="Program tool calls require the agy backend")
+        if program_tools and BACKEND == "agy":
+            tool_response = await generate_agy_tool_completion(request_body, request_id)
+            if request_body.stream:
+                return StreamingResponse(
+                    generate_agy_tool_stream(tool_response, request_id),
+                    media_type="text/event-stream",
+                )
+            return tool_response
         
         if request_body.stream:
             # Return streaming response
@@ -559,6 +714,8 @@ async def chat_completions(
             
             # Filter content
             prompt = MessageAdapter.filter_content(prompt)
+            new_prompt, _ = MessageAdapter.messages_to_prompt(request_body.messages)
+            new_prompt = MessageAdapter.filter_content(new_prompt)
             if system_prompt:
                 system_prompt = MessageAdapter.filter_content(system_prompt)
             
@@ -570,7 +727,7 @@ async def chat_completions(
                 claude_options.update(claude_headers)
             
             # Validate model
-            if claude_options.get('model'):
+            if BACKEND == "claude" and claude_options.get('model'):
                 ParameterValidator.validate_model(claude_options['model'])
             
             # Handle tools - disabled by default for OpenAI compatibility
@@ -581,9 +738,9 @@ async def chat_completions(
                                     'NotebookEdit', 'WebFetch', 'TodoRead', 'TodoWrite', 'WebSearch']
                 claude_options['disallowed_tools'] = disallowed_tools
                 claude_options['max_turns'] = 1  # Single turn for Q&A
-                logger.info("Tools disabled (default behavior for OpenAI compatibility)")
+                logger.info("Antigravity plan mode selected" if BACKEND == "agy" else "Tools disabled (default behavior for OpenAI compatibility)")
             else:
-                logger.info("Tools enabled by user request")
+                logger.info("Antigravity auto mode selected" if BACKEND == "agy" else "Tools enabled by user request")
             
             # Collect all chunks
             chunks = []
@@ -594,7 +751,9 @@ async def chat_completions(
                 max_turns=claude_options.get('max_turns', 10),
                 allowed_tools=claude_options.get('allowed_tools'),
                 disallowed_tools=claude_options.get('disallowed_tools'),
-                stream=False
+                stream=False,
+                **({"effort": request_body.agy_effort, "request_id": request_id,
+                    "session_id": actual_session_id, "incremental_prompt": new_prompt} if BACKEND == "agy" else {})
             ):
                 chunks.append(chunk)
             
@@ -641,9 +800,24 @@ async def chat_completions(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/v1/chat/completions")
+async def chat_completions(
+    request_body: ChatCompletionRequest,
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
+    async with session_manager.request_lock(request_body.session_id):
+        return await _chat_completions_impl(request_body, request, credentials)
+
+
 @app.get("/v1/models")
 async def list_models():
     """List available models."""
+    if BACKEND == "agy":
+        try:
+            return {"object": "list", "data": await claude_cli.list_models()}
+        except (OSError, RuntimeError) as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
     return {
         "object": "list",
         "data": [
@@ -756,11 +930,14 @@ async def get_auth_status():
     """Get Claude Code authentication status."""
     from auth import auth_manager
     
-    auth_info = get_claude_code_auth_info()
+    auth_info = ({"method": "agy CLI", "status": {"valid": None,
+                  "note": "CLI authentication is checked when a request runs"}}
+                 if BACKEND == "agy" else get_claude_code_auth_info())
     active_api_key = auth_manager.get_api_key()
     
     return {
         "claude_code_auth": auth_info,
+        "backend": BACKEND,
         "server_info": {
             "api_key_required": bool(active_api_key),
             "api_key_source": "environment" if os.getenv("API_KEY") else ("runtime" if runtime_api_key else "none"),
@@ -810,9 +987,12 @@ async def delete_session(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
 ):
     """Delete a specific session."""
-    deleted = session_manager.delete_session(session_id)
-    if not deleted:
-        raise HTTPException(status_code=404, detail="Session not found")
+    async with session_manager.request_lock(session_id):
+        deleted = session_manager.delete_session(session_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Session not found")
+        if BACKEND == "agy":
+            await claude_cli.close_session(session_id)
     
     return {"message": f"Session {session_id} deleted successfully"}
 

@@ -1,0 +1,26 @@
+{
+  "agy-wrapper-tool-log": {
+    "SessionStart": [
+      {"type": "command", "command": "python agy_hook_logger.py session", "timeout": 5}
+    ],
+    "PreInvocation": [
+      {"type": "command", "command": "python agy_hook_logger.py invocation", "timeout": 5}
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {"type": "command", "command": "python agy_hook_logger.py pre", "timeout": 5}
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {"type": "command", "command": "python agy_hook_logger.py post", "timeout": 5}
+        ]
+      }
+    ]
+  }
+}

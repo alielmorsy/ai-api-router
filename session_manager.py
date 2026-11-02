@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from threading import Lock
+from contextlib import asynccontextmanager
 import uuid
 
 from models import Message, SessionInfo
@@ -58,6 +59,17 @@ class SessionManager:
         self.default_ttl_hours = default_ttl_hours
         self.cleanup_interval_minutes = cleanup_interval_minutes
         self._cleanup_task = None
+        self._request_locks: Dict[str, asyncio.Lock] = {}
+
+    @asynccontextmanager
+    async def request_lock(self, session_id: Optional[str]):
+        if session_id is None:
+            yield
+            return
+        with self.lock:
+            lock = self._request_locks.setdefault(session_id, asyncio.Lock())
+        async with lock:
+            yield
     
     def start_cleanup_task(self):
         """Start the automatic cleanup task - call this after the event loop is running."""
@@ -206,6 +218,7 @@ class SessionManager:
         
         with self.lock:
             self.sessions.clear()
+            self._request_locks.clear()
             logger.info("Session manager shutdown complete")
 
 

@@ -1,5 +1,6 @@
 from typing import List, Optional, Dict, Any
 from models import Message
+import json
 import re
 
 
@@ -22,7 +23,12 @@ class MessageAdapter:
             elif message.role == "user":
                 conversation_parts.append(f"Human: {message.content}")
             elif message.role == "assistant":
-                conversation_parts.append(f"Assistant: {message.content}")
+                if message.tool_calls:
+                    conversation_parts.append(f"Assistant tool calls: {json.dumps(message.tool_calls)}")
+                elif message.content is not None:
+                    conversation_parts.append(f"Assistant: {message.content}")
+            elif message.role == "tool":
+                conversation_parts.append(f"Tool result ({message.tool_call_id}): {message.content}")
         
         # Join conversation parts
         prompt = "\n\n".join(conversation_parts)

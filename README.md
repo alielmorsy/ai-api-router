@@ -1,5 +1,75 @@
 # Claude Code OpenAI API Wrapper
 
+## Use Google Antigravity CLI (`agy`)
+
+The locally installed Antigravity CLI is the default response backend. Install and sign in to `agy` first, then start the server. The server keeps the same OpenAI-compatible `/v1/chat/completions` endpoint. `GET /v1/models` returns the model slugs and display names currently available to your `agy` account. You can still use `agy-default` to select the CLI's default model. Set `AGENT_BACKEND=claude` to use the Claude Code SDK instead. See [Antigravity's headless CLI documentation](https://antigravity.google/docs/cli/headless/) for CLI authentication and model selection.
+
+In PowerShell:
+
+```powershell
+agy --version
+agy -p 'Reply with pong' --output-format json
+uv run uvicorn main:app --host 127.0.0.1 --port 8000
+```
+
+Then send a request:
+
+```powershell
+Invoke-RestMethod -Uri 'http://127.0.0.1:8000/v1/models'
+$body = @{ model = 'agy-default'; effort = 'high'; messages = @(@{ role = 'user'; content = 'Hello' }); stream = $false } | ConvertTo-Json -Depth 5
+Invoke-RestMethod -Uri 'http://127.0.0.1:8000/v1/chat/completions' -Method Post -ContentType 'application/json' -Body $body
+```
+
+Set `AGY_CWD` to choose the working directory for the CLI. For requests with a `session_id`, the wrapper keeps one headless `agy` process per active session and sends later messages as new turns over its open stream JSON stdin. Different sessions can run concurrently; requests for one session are serialized. A model, effort, mode, schema, or system instruction change restarts that session's worker with its full stored history. Stateless requests still use isolated CLI processes so unrelated chats cannot share context. Deleting a session, shutting down the server, or leaving a worker idle for an hour closes its process. By default, requests use `agy --mode plan` with the `openai-api` agent in `.agents/agents/openai-api.md`, which has no file, terminal, web, or MCP tools. Requests with `enable_tools: true` use `agy --mode auto` and its built-in tools. If `AGY_CWD` points to another workspace, copy the `openai-api.md` agent into that workspace's `.agents/agents/` directory or install it globally, or set `AGY_API_AGENT` to the name of an equivalent tool-limited agent. Every run passes `--sandbox` and `--dangerously-skip-permissions`, plus a session-only artifact review setting of `always-proceed`, so headless requests do not wait for tool or plan review prompts. The API's `API_KEY` protection still applies if configured. Streaming requests use Antigravity's `stream-json` output.
+
+Requests can set `effort` or `reasoning_effort` to `low`, `medium`, `high`, `xhigh`, or `max`. The wrapper passes it as `agy --effort` for that request; the CLI checks whether the selected model supports the level. If both fields are provided, they must match.
+
+### Test tools supplied by your program
+
+Send OpenAI-style function definitions in `tools`. The wrapper asks `agy` which function to call and returns an OpenAI `tool_calls` response. Your program executes the function and sends its output back as a `role: "tool"` message. The wrapper never executes the function itself. Antigravity's permission-controlled file, terminal, web, and MCP tools are denied for these API runs, even though `--dangerously-skip-permissions` is present. You do not need `enable_tools` for program tools.
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="no-auth-required")
+tools = [{"type": "function", "function": {
+    "name": "get_number",
+    "description": "Return the test number",
+    "parameters": {"type": "object", "properties": {}},
+}}]
+messages = [{"role": "user", "content": "Test get_number and tell me its result."}]
+
+first = client.chat.completions.create(
+    model="agy-default", messages=messages, tools=tools, tool_choice="required"
+)
+call = first.choices[0].message.tool_calls[0]
+assert call.function.name == "get_number"
+result = "42"  # Your program runs get_number here.
+
+messages.extend([
+    first.choices[0].message.model_dump(exclude_none=True),
+    {"role": "tool", "tool_call_id": call.id, "content": result},
+])
+final = client.chat.completions.create(
+    model="agy-default", messages=messages, tools=tools, tool_choice="none"
+)
+print(final.choices[0].message.content)
+```
+
+The bridge supports `tool_choice` values `auto`, `none`, `required`, or a named function, as well as `parallel_tool_calls` and streaming chat completions. Tool arguments are JSON strings in the response. Validate them in your program before executing a function. If you configure `API_KEY`, use that key in the client instead of `no-auth-required`.
+
+### Streaming
+
+Set `stream: true` for OpenAI-compatible SSE. Ordinary text responses forward `agy`'s `agent_response.text_delta` fragments as they arrive, preserving spaces and newlines. Requests with program `tools` also return SSE chunks, but their content or `tool_calls` is sent after `agy` finishes: its `--json-schema` structured output is available only in the final `result` event. See [Antigravity's stream JSON documentation](https://antigravity.google/docs/cli/headless/).
+
+### Server tool logs
+
+The server's normal console log shows each `agy` worker starting, being reused, and closing, plus turn starts, tool states, result status, and token totals when the CLI reports them. Lines include request and session IDs so simultaneous chats can be followed separately. For example, run `uv run uvicorn main:app --host 127.0.0.1 --port 8000` and watch that terminal. These activity lines omit prompt text and tool arguments.
+
+The server logs each program function call it returns and each `role: "tool"` result it receives, using the request ID, call ID, and function name. Antigravity's workspace hooks in `.agents/hooks.json` also report session starts, model invocations, and built-in tool attempts/completions to the server log. Hook entries include the CLI conversation ID, tool name, outcome, step, and model. Arguments, tool output, and prompts are not logged. Hook events are collected after each turn and once more when a worker closes; program function events are logged when the corresponding API request is handled.
+
+The hooks load when `agy` runs in this repository. If you set `AGY_CWD` to another workspace, copy `.agents/hooks.json` and `.agents/agy_hook_logger.py` into that workspace's `.agents` directory to capture its CLI hook events. The program function logs work regardless of `AGY_CWD`. See [Antigravity's hooks documentation](https://antigravity.google/docs/hooks?tab=cli) for the workspace hook format.
+
 An OpenAI API-compatible wrapper for Claude Code, allowing you to use Claude Code with any OpenAI client library. **Now powered by the official Claude Code Python SDK** with enhanced authentication and features.
 
 ## Status

@@ -14,9 +14,11 @@ class ContentPart(BaseModel):
 
 
 class Message(BaseModel):
-    role: Literal["system", "user", "assistant"]
-    content: Union[str, List[ContentPart]]
+    role: Literal["system", "user", "assistant", "tool"]
+    content: Optional[Union[str, List[ContentPart]]] = None
     name: Optional[str] = None
+    tool_call_id: Optional[str] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = None
     
     @model_validator(mode='after')
     def normalize_content(self):
@@ -36,9 +38,25 @@ class Message(BaseModel):
         return self
 
 
+class FunctionDefinition(BaseModel):
+    name: str
+    description: Optional[str] = None
+    parameters: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ToolDefinition(BaseModel):
+    type: Literal["function"]
+    function: FunctionDefinition
+
+
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: List[Message]
+    tools: Optional[List[ToolDefinition]] = None
+    tool_choice: Optional[Union[Literal["auto", "none", "required"], Dict[str, Any]]] = None
+    parallel_tool_calls: bool = True
+    effort: Optional[Literal["low", "medium", "high", "xhigh", "max"]] = None
+    reasoning_effort: Optional[Literal["low", "medium", "high", "xhigh", "max"]] = None
     temperature: Optional[float] = Field(default=1.0, ge=0, le=2)
     top_p: Optional[float] = Field(default=1.0, ge=0, le=1)
     n: Optional[int] = Field(default=1, ge=1)
@@ -50,7 +68,17 @@ class ChatCompletionRequest(BaseModel):
     logit_bias: Optional[Dict[str, float]] = None
     user: Optional[str] = None
     session_id: Optional[str] = Field(default=None, description="Optional session ID for conversation continuity")
-    enable_tools: Optional[bool] = Field(default=False, description="Enable Claude Code tools (Read, Write, Bash, etc.) - disabled by default for OpenAI compatibility")
+    enable_tools: Optional[bool] = Field(default=False, description="Enable Claude Code tools; with Antigravity use the tools field for program functions")
+
+    @model_validator(mode='after')
+    def validate_effort(self):
+        if self.effort and self.reasoning_effort and self.effort != self.reasoning_effort:
+            raise ValueError("effort and reasoning_effort must match when both are provided")
+        return self
+
+    @property
+    def agy_effort(self) -> Optional[str]:
+        return self.effort or self.reasoning_effort
     
     @field_validator('n')
     @classmethod
@@ -109,7 +137,7 @@ class ChatCompletionRequest(BaseModel):
 class Choice(BaseModel):
     index: int
     message: Message
-    finish_reason: Optional[Literal["stop", "length", "content_filter", "null"]] = None
+    finish_reason: Optional[Literal["stop", "length", "content_filter", "tool_calls", "null"]] = None
 
 
 class Usage(BaseModel):
@@ -131,7 +159,7 @@ class ChatCompletionResponse(BaseModel):
 class StreamChoice(BaseModel):
     index: int
     delta: Dict[str, Any]
-    finish_reason: Optional[Literal["stop", "length", "content_filter", "null"]] = None
+    finish_reason: Optional[Literal["stop", "length", "content_filter", "tool_calls", "null"]] = None
 
 
 class ChatCompletionStreamResponse(BaseModel):
