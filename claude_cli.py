@@ -18,6 +18,7 @@ class _ClaudeWorker:
         self.lock = asyncio.Lock()
         self.process = None
         self.command = None
+        self.context_key = None
         self.stderr_task = None
         self.last_used = time.monotonic()
 
@@ -107,6 +108,9 @@ class ClaudeCodeCLI:
         continue_session: bool = False,
         request_id: Optional[str] = None,
         incremental_prompt: Optional[str] = None,
+        structured_schema: Optional[Dict[str, Any]] = None,
+        external_tools: bool = False,
+        context_key: Optional[str] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         command = [
             "claude", "--print", "--verbose", "--input-format", "stream-json",
@@ -120,10 +124,12 @@ class ClaudeCodeCLI:
             command.extend(["--effort", effort])
         if system_prompt:
             command.extend(["--system-prompt", system_prompt])
-        if disallowed_tools:
+        if external_tools or disallowed_tools:
             command.extend(["--tools", ""])
         elif allowed_tools:
             command.extend(["--allowedTools", ",".join(allowed_tools)])
+        if structured_schema is not None:
+            command.extend(["--json-schema", json.dumps(structured_schema)])
 
         if session_id is not None:
             async with self._workers_lock:
@@ -134,6 +140,8 @@ class ClaudeCodeCLI:
         async with worker.lock:
             if worker.process is not None and (
                 worker.process.returncode is not None or worker.command != command
+                # Tool prompts embed functions/system text in the prompt; restart when it changes.
+                or worker.context_key != context_key
             ):
                 await _stop_worker(worker, run_id, reason="settings_changed_or_exited")
             fresh = worker.process is None
@@ -144,6 +152,7 @@ class ClaudeCodeCLI:
                     env={**os.environ, **self.claude_env_vars},
                 )
                 worker.command = command
+                worker.context_key = context_key
                 worker.stderr_task = asyncio.create_task(worker.process.stderr.read())
                 logger.info("claude worker request=%s session=%r pid=%s action=start model=%s effort=%s",
                             run_id, session_id, getattr(worker.process, "pid", None), model, effort)
@@ -177,6 +186,8 @@ class ClaudeCodeCLI:
                     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                         raise RuntimeError("Claude Code CLI returned invalid JSON") from exc
                     event_type = event.get("type")
+                    if structured_schema is not None and event_type in ("stream_event", "assistant"):
+                        continue
                     if event_type == "stream_event":
                         inner = event.get("event") or {}
                         delta = inner.get("delta") or {}
@@ -199,6 +210,11 @@ class ClaudeCodeCLI:
                                     run_id, session_id, event.get("subtype"), event.get("total_cost_usd"))
                         if event.get("is_error") or event.get("subtype") != "success":
                             raise RuntimeError(event.get("result") or event.get("error") or "Claude Code CLI failed")
+                        if structured_schema is not None:
+                            structured_output = event.get("structured_output")
+                            if not isinstance(structured_output, dict):
+                                raise RuntimeError("Claude Code CLI did not return structured output")
+                            yield {"type": "result", "structured_output": structured_output}
                         completed = True
                         break
                 if not saw_result:

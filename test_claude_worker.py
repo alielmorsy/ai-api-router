@@ -220,3 +220,98 @@ def test_explicit_backend_setting_does_not_hide_agy_sessions(monkeypatch):
         })
         assert response.status_code == 200, response.text
         assert response.json()["choices"][0]["message"]["content"] == "Agy answer"
+
+
+@pytest.mark.asyncio
+async def test_claude_worker_returns_structured_output_without_builtin_tools(monkeypatch):
+    commands = []
+    structured = {"content": "", "tool_calls": [{"name": "get_weather", "arguments": {"city": "Cairo"}}]}
+
+    class StructuredProcess(FakeClaudeProcess):
+        def write(self, data):
+            self.turns.append(json.loads(data))
+            for event in (
+                {"type": "assistant", "message": {"content": [{"type": "text", "text": "ignored"}]}},
+                {"type": "result", "subtype": "success", "is_error": False, "structured_output": structured},
+            ):
+                self.events.put_nowait((json.dumps(event) + "\n").encode())
+
+    async def start(*args, **kwargs):
+        commands.append(args)
+        return StructuredProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", start)
+    cli = ClaudeCodeCLI(timeout=30000)
+    chunks = [chunk async for chunk in cli.run_completion(
+        "prompt", model="sonnet", structured_schema={"type": "object"}, external_tools=True,
+    )]
+    assert chunks == [{"type": "result", "structured_output": structured}]
+    assert commands[0][commands[0].index("--tools") + 1] == ""
+    assert json.loads(commands[0][commands[0].index("--json-schema") + 1]) == {"type": "object"}
+
+
+def test_claude_alias_handles_program_tool_calls(monkeypatch):
+    import main
+
+    calls = []
+
+    async def completion(**kwargs):
+        calls.append(kwargs)
+        yield {"type": "result", "structured_output": {
+            "content": "", "tool_calls": [{"name": "get_weather", "arguments": {"city": "Cairo"}}],
+        }}
+
+    monkeypatch.setattr(main.claude_worker_cli, "run_completion", completion)
+    monkeypatch.setattr(main.claude_cli, "verify_cli", AsyncMock(return_value=True))
+    with TestClient(main.app) as client:
+        response = client.post("/v1/chat/completions", json={
+            "model": "opus", "effort": "max",
+            "messages": [{"role": "user", "content": "Weather in Cairo?"}],
+            "tools": [{"type": "function", "function": {
+                "name": "get_weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+            }}],
+        })
+    assert response.status_code == 200, response.text
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["tool_calls"][0]["function"]["name"] == "get_weather"
+    assert calls[0]["model"] == "opus" and calls[0]["effort"] == "max"
+    assert calls[0]["external_tools"] is True
+
+
+def test_openai_style_client_keeps_session_from_header_and_sends_only_new_turns(monkeypatch):
+    import main
+
+    calls = []
+    closed = []
+
+    async def completion(**kwargs):
+        calls.append(kwargs)
+        yield {"content": [{"type": "text", "text": f"answer {len(calls)}"}]}
+
+    async def close_session(session_id):
+        closed.append(session_id)
+
+    monkeypatch.setattr(main.claude_worker_cli, "run_completion", completion)
+    monkeypatch.setattr(main.claude_worker_cli, "close_session", close_session)
+    monkeypatch.setattr(main.claude_cli, "close_session", close_session)
+    monkeypatch.setattr(main.claude_cli, "verify_cli", AsyncMock(return_value=True))
+    history = [{"role": "system", "content": "sys"}, {"role": "user", "content": "one"}]
+    with TestClient(main.app) as client:
+        for key, extra in (("x-session-id", {}), (None, {"prompt_cache_key": "chat-1"})):
+            response = client.post("/v1/chat/completions", json={"model": "haiku", "messages": history, **extra},
+                                   headers={key: "chat-1"} if key else {})
+            assert response.status_code == 200, response.text
+            history = history + [response.json()["choices"][0]["message"], {"role": "user", "content": "two"}]
+        # An edited history no longer matches the session, so its worker is restarted with everything.
+        response = client.post("/v1/chat/completions", json={
+            "model": "haiku", "prompt_cache_key": "chat-1",
+            "messages": [{"role": "user", "content": "other"}, {"role": "assistant", "content": "x"},
+                         {"role": "user", "content": "three"}],
+        })
+        assert response.status_code == 200, response.text
+    assert [call["session_id"] for call in calls] == ["chat-1"] * 3
+    assert calls[1]["incremental_prompt"] == "Human: two"
+    assert "other" in calls[2]["prompt"] and "one" not in calls[2]["prompt"]
+    assert closed.count("chat-1") == 4  # first turn and the reset, once per worker pool
+    main.session_manager.delete_session("chat-1")

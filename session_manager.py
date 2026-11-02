@@ -50,6 +50,17 @@ class Session:
         )
 
 
+def _same_message(stored: Message, sent: Message) -> bool:
+    """Match a stored message against the client's echo of it; assistant text may be reformatted."""
+    def call_ids(message):
+        return [call.get("id") for call in message.tool_calls or []]
+    if stored.role != sent.role or call_ids(stored) != call_ids(sent):
+        return False
+    if stored.role == "assistant":
+        return True
+    return (stored.content or "").strip() == (sent.content or "").strip() and stored.tool_call_id == sent.tool_call_id
+
+
 class SessionManager:
     """Manages conversation sessions with automatic cleanup."""
     
@@ -164,30 +175,42 @@ class SessionManager:
                 for session in self.sessions.values()
             ]
     
-    def process_messages(self, messages: List[Message], session_id: Optional[str] = None) -> Tuple[List[Message], Optional[str]]:
+    def process_messages(
+        self, messages: List[Message], session_id: Optional[str] = None
+    ) -> Tuple[List[Message], Optional[str], List[Message]]:
         """
         Process messages for a request, handling both stateless and session modes.
-        
+
+        Clients may send only the new messages, or (OpenAI style) the whole history every time.
+        A resent history is recognised by its stored prefix; if it no longer matches (edited or
+        regenerated chat), the session is rebuilt from the request.
+
         Returns:
-            Tuple of (all_messages_for_claude, actual_session_id_used)
+            Tuple of (all_messages_for_claude, actual_session_id_used, messages_new_to_the_worker).
+            When the new messages are all the messages, any live worker for the session is stale.
         """
         if session_id is None:
             # Stateless mode - just return the messages as-is
-            return messages, None
-        
-        # Session mode - get or create session and merge messages
+            return messages, None, messages
+
         session = self.get_or_create_session(session_id)
-        
-        # Add new messages to session
-        session.add_messages(messages)
-        
-        # Return all messages in the session for Claude
+        stored = session.messages
+        if len(messages) > len(stored) and all(
+            _same_message(a, b) for a, b in zip(stored, messages)
+        ):
+            new_messages = messages[len(stored):]
+        elif any(message.role == "assistant" for message in messages):
+            session.messages = []
+            new_messages = messages
+        else:
+            new_messages = messages
+        session.add_messages(new_messages)
         all_messages = session.get_all_messages()
-        
-        logger.info(f"Session {session_id}: processing {len(messages)} new messages, {len(all_messages)} total")
-        
-        return all_messages, session_id
-    
+
+        logger.info(f"Session {session_id}: processing {len(new_messages)} new messages, {len(all_messages)} total")
+
+        return all_messages, session_id, new_messages
+
     def add_assistant_response(self, session_id: Optional[str], assistant_message: Message):
         """Add assistant response to session if session mode is active."""
         if session_id is None:

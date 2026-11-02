@@ -95,7 +95,7 @@ final = client.chat.completions.create(model="agy-default", messages=messages,
 print(final.choices[0].message.content)
 ```
 
-`tool_choice` supports `auto`, `none`, `required` and a named function. Arguments come back as a JSON string, so validate them before executing. Streaming works, but chunks are sent after `agy` finishes, because structured output only arrives in the final `result` event. Plain text requests stream `text_delta` fragments live.
+`tool_choice` supports `auto`, `none`, `required` and a named function. Arguments come back as a JSON string, so validate them before executing. Works with both workers (`opus`/`sonnet`/`haiku` go to Claude Code via `--json-schema`, everything else to `agy`). Streaming works, but chunks are sent after the worker finishes, because structured output only arrives in the final `result` event. Plain text requests stream `text_delta` fragments live.
 
 ## Configuration
 

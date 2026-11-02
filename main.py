@@ -120,6 +120,18 @@ claude_worker_cli = ClaudeCodeCLI(
 CLAUDE_ALIASES = ("opus", "sonnet", "haiku")
 
 
+async def process_session_messages(request: ChatCompletionRequest):
+    """Merge the request into its session; return (all messages, session id, messages new to the worker)."""
+    all_messages, session_id, new_messages = session_manager.process_messages(
+        request.messages, request.session_id
+    )
+    if session_id and len(new_messages) == len(all_messages):
+        # The worker must see the whole conversation, so a live one from an older history is stale.
+        await claude_cli.close_session(session_id)
+        await claude_worker_cli.close_session(session_id)
+    return all_messages, session_id, new_messages
+
+
 def backend_for_model(model: str) -> str:
     return "claude" if model in CLAUDE_ALIASES else "agy"
 
@@ -340,10 +352,8 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 async def generate_agy_tool_completion(
     request: ChatCompletionRequest, request_id: str
 ) -> ChatCompletionResponse:
-    """Ask agy to choose from the caller's functions without running CLI tools."""
-    all_messages, actual_session_id = session_manager.process_messages(
-        request.messages, request.session_id
-    )
+    """Ask the model's worker to choose from the caller's functions without running CLI tools."""
+    all_messages, actual_session_id, new_messages = await process_session_messages(request)
     prior_call_names = {
         call.get("id"): call.get("function", {}).get("name")
         for message in all_messages
@@ -358,10 +368,10 @@ async def generate_agy_tool_completion(
             )
     conversation, system_prompt = MessageAdapter.messages_to_prompt(all_messages)
     prompt = build_tool_prompt(conversation, system_prompt, request)
-    new_conversation, _ = MessageAdapter.messages_to_prompt(request.messages)
+    new_conversation, _ = MessageAdapter.messages_to_prompt(new_messages)
     incremental_prompt = build_tool_prompt(new_conversation, system_prompt, request)
     structured_output = None
-    async for chunk in claude_cli.run_completion(
+    async for chunk in cli_for_model(request.model).run_completion(
         prompt=prompt,
         model=request.model,
         effort=request.agy_effort,
@@ -376,7 +386,7 @@ async def generate_agy_tool_completion(
         if chunk.get("type") == "result":
             structured_output = chunk.get("structured_output")
     if structured_output is None:
-        raise HTTPException(status_code=502, detail="Antigravity returned no structured tool response")
+        raise HTTPException(status_code=502, detail="Worker returned no structured tool response")
     try:
         content, tool_calls = parse_tool_result(structured_output, request)
     except ValueError as exc:
@@ -454,16 +464,14 @@ async def _generate_streaming_response_impl(
     backend_cli = cli_for_model(request.model)
     try:
         # Process messages with session management
-        all_messages, actual_session_id = session_manager.process_messages(
-            request.messages, request.session_id
-        )
+        all_messages, actual_session_id, new_messages = await process_session_messages(request)
         
         # Convert messages to prompt
         prompt, system_prompt = MessageAdapter.messages_to_prompt(all_messages)
         
         # Filter content for unsupported features
         prompt = MessageAdapter.filter_content(prompt)
-        new_prompt, _ = MessageAdapter.messages_to_prompt(request.messages)
+        new_prompt, _ = MessageAdapter.messages_to_prompt(new_messages)
         new_prompt = MessageAdapter.filter_content(new_prompt)
         if system_prompt:
             system_prompt = MessageAdapter.filter_content(system_prompt)
@@ -697,9 +705,7 @@ async def _chat_completions_impl(
             or request_body.tool_choice is not None
             or any(message.role == "tool" for message in request_body.messages)
         )
-        if program_tools and backend == "claude":
-            raise HTTPException(status_code=400, detail="Program tool calls require the agy backend")
-        if program_tools and backend == "agy":
+        if program_tools:
             tool_response = await generate_agy_tool_completion(request_body, request_id)
             if request_body.stream:
                 return StreamingResponse(
@@ -721,9 +727,7 @@ async def _chat_completions_impl(
         else:
             # Non-streaming response
             # Process messages with session management
-            all_messages, actual_session_id = session_manager.process_messages(
-                request_body.messages, request_body.session_id
-            )
+            all_messages, actual_session_id, new_messages = await process_session_messages(request_body)
             
             logger.info(f"Chat completion: session_id={actual_session_id}, total_messages={len(all_messages)}")
             
@@ -732,7 +736,7 @@ async def _chat_completions_impl(
             
             # Filter content
             prompt = MessageAdapter.filter_content(prompt)
-            new_prompt, _ = MessageAdapter.messages_to_prompt(request_body.messages)
+            new_prompt, _ = MessageAdapter.messages_to_prompt(new_messages)
             new_prompt = MessageAdapter.filter_content(new_prompt)
             if system_prompt:
                 system_prompt = MessageAdapter.filter_content(system_prompt)
@@ -826,6 +830,10 @@ async def chat_completions(
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
+    # OpenAI clients key conversations with prompt_cache_key or an X-Session-ID header.
+    request_body.session_id = (
+        request_body.session_id or request.headers.get("x-session-id") or request_body.prompt_cache_key
+    )
     async with session_manager.request_lock(request_body.session_id):
         return await _chat_completions_impl(request_body, request, credentials)
 

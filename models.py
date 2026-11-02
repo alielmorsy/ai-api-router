@@ -68,6 +68,7 @@ class ChatCompletionRequest(BaseModel):
     logit_bias: Optional[Dict[str, float]] = None
     user: Optional[str] = None
     session_id: Optional[str] = Field(default=None, description="Optional session ID for conversation continuity")
+    prompt_cache_key: Optional[str] = Field(default=None, description="OpenAI cache key; used as session_id when that is absent")
     enable_tools: Optional[bool] = Field(default=False, description="Enable Claude Code tools; with Antigravity use the tools field for program functions")
 
     @model_validator(mode='after')
