@@ -12,6 +12,7 @@ from typing import Any, AsyncGenerator, Dict, List, Optional
 
 
 logger = logging.getLogger(__name__)
+CLI_EVENT_LINE_LIMIT = 16 * 1024 * 1024
 BUILTIN_TOOL_DENY_RULES = [
     "read_file(*)", "write_file(*)", "read_url(*)", "execute_url(*)",
     "command(*)", "mcp(*)",
@@ -220,6 +221,7 @@ class AgyCLI:
                     worker.process = await asyncio.create_subprocess_exec(
                         *command, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE, cwd=str(self.cwd),
+                        limit=CLI_EVENT_LINE_LIMIT,
                         env={**os.environ, "AGY_WRAPPER_HOOK_LOG": str(worker.hook_log)},
                     )
                 except BaseException:

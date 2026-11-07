@@ -10,6 +10,7 @@ from typing import Any, AsyncGenerator, Dict, List, Optional
 
 
 logger = logging.getLogger(__name__)
+CLI_EVENT_LINE_LIMIT = 16 * 1024 * 1024
 
 
 class _ClaudeWorker:
@@ -149,6 +150,7 @@ class ClaudeCodeCLI:
                 worker.process = await asyncio.create_subprocess_exec(
                     *command, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE, cwd=str(self.cwd),
+                    limit=CLI_EVENT_LINE_LIMIT,
                     env={**os.environ, **self.claude_env_vars},
                 )
                 worker.command = command
