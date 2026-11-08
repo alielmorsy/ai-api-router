@@ -4,6 +4,7 @@ import asyncio
 import logging
 import secrets
 import string
+import anyio
 from typing import Optional, AsyncGenerator, Dict, Any
 from contextlib import asynccontextmanager
 
@@ -35,6 +36,7 @@ from message_adapter import MessageAdapter
 from auth import verify_api_key, security, validate_claude_code_auth, get_claude_code_auth_info
 from parameter_validator import ParameterValidator, CompatibilityReporter
 from session_manager import session_manager
+from auto_sessions import AutomaticSessionCache, CachedStreamingResponse
 
 # Load environment variables
 load_dotenv()
@@ -120,6 +122,15 @@ claude_worker_cli = ClaudeCodeCLI(
 CLAUDE_ALIASES = ("opus", "sonnet", "haiku")
 
 
+async def close_cached_session(session_id: str) -> None:
+    await claude_cli.close_session(session_id)
+    if claude_worker_cli is not claude_cli:
+        await claude_worker_cli.close_session(session_id)
+
+
+auto_sessions = AutomaticSessionCache(session_manager, close_cached_session)
+
+
 async def process_session_messages(request: ChatCompletionRequest):
     """Merge the request into its session; return (all messages, session id, messages new to the worker)."""
     all_messages, session_id, new_messages = session_manager.process_messages(
@@ -188,6 +199,7 @@ async def lifespan(app: FastAPI):
     async def reap_workers():
         while True:
             await asyncio.sleep(60)
+            await auto_sessions.reap()
             await claude_cli.reap_idle()
             if claude_worker_cli is not claude_cli:
                 await claude_worker_cli.reap_idle()
@@ -204,6 +216,7 @@ async def lifespan(app: FastAPI):
             await worker_reaper
         except asyncio.CancelledError:
             pass
+    await auto_sessions.shutdown()
     await claude_cli.shutdown()
     if claude_worker_cli is not claude_cli:
         await claude_worker_cli.shutdown()
@@ -834,8 +847,28 @@ async def chat_completions(
     request_body.session_id = (
         request_body.session_id or request.headers.get("x-session-id") or request_body.prompt_cache_key
     )
-    async with session_manager.request_lock(request_body.session_id):
-        return await _chat_completions_impl(request_body, request, credentials)
+    automatic_id = None
+    if request_body.session_id is None:
+        # Authenticate before allocating processes or looking up conversations.
+        await verify_api_key(request, credentials)
+        automatic_id = await auto_sessions.reserve(
+            request_body, ParameterValidator.extract_claude_headers(dict(request.headers))
+        )
+        request_body.session_id = automatic_id
+    handed_to_stream = False
+    success = False
+    try:
+        async with session_manager.request_lock(request_body.session_id):
+            response = await _chat_completions_impl(request_body, request, credentials)
+        if automatic_id and isinstance(response, StreamingResponse):
+            response = CachedStreamingResponse(response, auto_sessions, automatic_id)
+            handed_to_stream = True
+        success = True
+        return response
+    finally:
+        if automatic_id and not handed_to_stream:
+            with anyio.CancelScope(shield=True):
+                await auto_sessions.finish(automatic_id, success)
 
 
 @app.get("/v1/models")
@@ -1016,6 +1049,7 @@ async def delete_session(
         deleted = session_manager.delete_session(session_id)
         if not deleted:
             raise HTTPException(status_code=404, detail="Session not found")
+        await auto_sessions.discard(session_id)
         await claude_cli.close_session(session_id)
         if claude_worker_cli is not claude_cli:
             await claude_worker_cli.close_session(session_id)

@@ -14,7 +14,10 @@ OpenAI client ──► FastAPI (main.py) ──► model alias? ──► opus/
   - Different sessions run in parallel. Requests inside one session are serialized.
   - A change of model, effort, mode, schema or system prompt restarts that session's worker and replays the stored history.
   - Workers close when you delete the session, when the server shuts down, or after one idle hour.
-- **Stateless requests** (no `session_id`) use a throwaway process each, so unrelated chats never share context.
+- **Automatic worker reuse.** Clients that resend the full `messages` history need no custom session ID. The wrapper hashes completed histories and worker settings, reuses a matching idle process, and sends only the new messages. Model, effort, tool definitions, tool choice, and caller `user` participate in matching. Each request still generates a new answer.
+  - Initial requests, edited histories, regenerations, and concurrent branches start independent processes. Matching requires the exact previous messages, including assistant text and tool-call IDs.
+  - Up to 128 automatic workers are kept in memory and expire after one idle hour. Eviction, failed turns, disconnects, session deletion, and shutdown close their processes. If all cache slots are busy, new requests use throwaway processes.
+  - Explicit `session_id`, `X-Session-ID`, or `prompt_cache_key` takes precedence. Requests with built-in tools enabled (`enable_tools: true`) need an explicit ID to keep a process; caller-defined program tools support automatic reuse.
 - **No tools by default.** API requests run `agy` in `--mode plan` with the tool-less `openai-api` agent (`.agents/agents/openai-api.md`) and deny file, terminal, web and MCP tools. Claude runs with its tools disabled. Pass `enable_tools: true` to allow the CLI's built-in tools (`agy --mode auto`).
 - **Program tools without execution.** When you send OpenAI `tools`, the wrapper asks `agy` for a structured JSON answer (`--json-schema`) naming the function and arguments, validates it against what you offered and `tool_choice`, and returns a normal `tool_calls` response. Your program runs the function and replies with a `role: "tool"` message. The wrapper never runs your functions, and `agy`'s built-in tools stay denied for these requests.
 - **Observability.** Console logs show worker start, reuse and close, turn starts, tool states, result status and token totals, tagged with request and session IDs. Workspace hooks (`.agents/hooks.json`) add CLI-side session, model and tool events. Prompts and tool arguments are never logged.
@@ -67,6 +70,23 @@ print(r.choices[0].message.content)
 | `stream` | OpenAI SSE |
 
 ### Sessions
+
+Standard clients can send the complete conversation on every request:
+
+```python
+messages = [{"role": "user", "content": "My name is Alice."}]
+first = client.chat.completions.create(
+    model="haiku", messages=messages, extra_body={"effort": "low"},
+)
+messages += [first.choices[0].message.model_dump(exclude_none=True),
+             {"role": "user", "content": "What's my name?"}]
+second = client.chat.completions.create(
+    model="haiku", messages=messages, extra_body={"effort": "low"},
+)
+```
+
+The second call automatically reuses the first call's worker. To send only new
+messages instead, supply a stable explicit session ID:
 
 ```python
 client.chat.completions.create(model="sonnet", extra_body={"session_id": "s1"},
